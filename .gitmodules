@@ -1,0 +1,12 @@
+[submodule "RMMT-API"]
+	path = RMMT-API
+	url = git@github.com:ZhiXin-College/RMMT-API.git
+	branch = React
+[submodule "RMMT-Admin"]
+	path = RMMT-Admin
+	url = git@github.com:ZhiXin-College/RMMT-Admin.git
+	branch = React
+[submodule "RMMT-Student"]
+	path = RMMT-Student
+	url = git@github.com:ZhiXin-College/RMMT-Student.git
+	branch = React

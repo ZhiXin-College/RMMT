@@ -1,0 +1,195 @@
+# RMMT local Docker cluster
+# Usage:
+#   cd /root/v1 && docker compose up -d --build
+#   Student:  http://localhost/
+#   Admin:    http://admin.localhost/
+#   API:      http://api.localhost/  or  http://localhost/api/
+
+name: rmmt
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: rmmt-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rmmt_root_pass}
+      MYSQL_DATABASE: ${DB_NAME:-roommate}
+      MYSQL_USER: ${DB_USER:-rmmt}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-rmmt_pass}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - rmmt_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rmmt_root_pass}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    networks:
+      - rmmt-net
+    # Keep MySQL off the host by default; uncomment if you need local clients
+    # ports:
+    #   - "3306:3306"
+
+  rmmt-api:
+    build:
+      context: ./RMMT-API
+      dockerfile: Dockerfile.cluster
+      args:
+        NAME: rmmt-api
+    container_name: rmmt-api
+    restart: unless-stopped
+    environment:
+      NAME: rmmt-api
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-roommate}
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rmmt_root_pass}
+      JWT_SECRET: ${JWT_SECRET:-rmmt-dev-secret}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.deepseek.com}
+      AI_MODEL: ${AI_MODEL:-deepseek-chat}
+      MATCHING_V2_FORCE_CPU: "1"
+      # Low-memory host: fewer gunicorn workers
+      WEB_CONCURRENCY: 2
+    volumes:
+      # 持久化上传文件（logo / 登录背景 / 学生头像），宿主机路径跨重建保留
+      - /var/lib/rmmt/uploads:/app/static/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - rmmt-net
+    # Direct access for debugging (also available via proxy)
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # Background matching-score worker (MATCHING_ALGORITHM=v2)
+  rmmt-api-task:
+    build:
+      context: ./RMMT-API
+      dockerfile: Dockerfile.task
+      args:
+        NAME: rmmt-api-task
+    container_name: rmmt-api-task
+    restart: unless-stopped
+    mem_limit: 2g
+    memswap_limit: 3g
+    environment:
+      NAME: rmmt-api-task
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-roommate}
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rmmt_root_pass}
+      JWT_SECRET: ${JWT_SECRET:-rmmt-dev-secret}
+      MATCHING_ALGORITHM: v2
+      MATCHING_V2_FORCE_CPU: "1"
+      MATCHING_V2_ALPHA: ${MATCHING_V2_ALPHA:-0.7}
+      MATCHING_V2_BETA: ${MATCHING_V2_BETA:-0.3}
+      HF_ENDPOINT: https://hf-mirror.com
+      # Prefer local/cached models when present
+      TRANSFORMERS_CACHE: /app/.cache/huggingface
+      HF_HOME: /app/.cache/huggingface
+    volumes:
+      - rmmt_hf_cache:/app/.cache/huggingface
+      - rmmt_task_log:/app/log
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rmmt-api:
+        condition: service_healthy
+    networks:
+      - rmmt-net
+
+  rmmt-student:
+    build:
+      context: ./RMMT-Student
+      dockerfile: Dockerfile
+    container_name: rmmt-student
+    restart: unless-stopped
+    depends_on:
+      rmmt-api:
+        condition: service_healthy
+    networks:
+      - rmmt-net
+
+  rmmt-admin:
+    build:
+      context: ./RMMT-Admin
+      dockerfile: Dockerfile
+      args:
+        VITE_BASE: /admin/
+    container_name: rmmt-admin
+    restart: unless-stopped
+    depends_on:
+      rmmt-api:
+        condition: service_healthy
+    networks:
+      - rmmt-net
+
+  # MySQL web UI — 默认关闭，公网勿暴露。需要时：
+  #   docker compose --profile db-ui up -d phpmyadmin
+  phpmyadmin:
+    image: phpmyadmin:5.2-apache
+    container_name: rmmt-phpmyadmin
+    profiles: ["db-ui"]
+    restart: unless-stopped
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      UPLOAD_LIMIT: 64M
+      PMA_ABSOLUTE_URI: ${PMA_ABSOLUTE_URI:-http://127.0.0.1:8081/}
+    # 仅本机访问；不挂到 reverse-proxy 的 /db
+    ports:
+      - "127.0.0.1:8081:80"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - rmmt-net
+
+  reverse-proxy:
+    image: nginx:1.27-alpine
+    container_name: rmmt-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - rmmt-student
+      - rmmt-admin
+      - rmmt-api
+    networks:
+      - rmmt-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+networks:
+  rmmt-net:
+    name: rmmt-net
+    driver: bridge
+
+volumes:
+  rmmt_mysql_data:
+    name: rmmt_mysql_data
+  rmmt_hf_cache:
+    name: rmmt_hf_cache
+  rmmt_task_log:
+    name: rmmt_task_log
